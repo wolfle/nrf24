@@ -1,6 +1,7 @@
 #ifndef _NRF24_H_
 #define _NRF24_H_
 
+//cdev driver ioctl commands
 #define NRF24_IOC_RD_MODE			_IOR(SPI_IOC_MAGIC, 0, __u8)
 #define NRF24_IOC_WR_MODE			_IOW(SPI_IOC_MAGIC, 0, __u8)
 #define NRF24_IOC_RD_ADDR0			_IOR(SPI_IOC_MAGIC, 1, char[5])
@@ -45,5 +46,12 @@
 #define RX_P0	(1<<0)
 
 #define RX_MASK (RX_P0|RX_P1|RX_P2|RX_P3|RX_P4|RX_P5)
+
+//netdev driver ioctl commands
+#define SET_CHANNEL SIOCDEVPRIVATE //...+15  
+#define GET_CHANNEL SIOCDEVPRIVATE+1
+#define GET_RPD SIOCDEVPRIVATE+2
+#define SET_PIPES SIOCDEVPRIVATE+3
+#define GET_PIPES SIOCDEVPRIVATE+4
 
 #endif
