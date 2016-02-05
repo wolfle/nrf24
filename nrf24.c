@@ -492,7 +492,7 @@ static void dev_setup(struct net_device *dev){
 	dev->netdev_ops = &netdev_ops;
 	dev->flags           |= IFF_NOARP|IFF_POINTOPOINT;
 	dev->features        |= NETIF_F_HW_CSUM;
-	dev->watchdog_timeo = TIMEOUT;
+	//dev->watchdog_timeo = TIMEOUT;
 	dev->irq = nrf24->spi->irq;
 	dev->type = ARPHRD_NONE;
 	dev->mtu = 32+1;

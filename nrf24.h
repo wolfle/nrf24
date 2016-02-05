@@ -1,7 +1,7 @@
 #ifndef _NRF24_H_
 #define _NRF24_H_
 
-#define TIMEOUT HZ*2  //2 seconds
+//#define TIMEOUT HZ*2  //2 seconds
 //cdev driver ioctl commands
 #define NRF24_IOC_RD_MODE			_IOR(SPI_IOC_MAGIC, 0, __u8)
 #define NRF24_IOC_WR_MODE			_IOW(SPI_IOC_MAGIC, 0, __u8)
