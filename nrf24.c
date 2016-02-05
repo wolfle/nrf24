@@ -300,7 +300,6 @@ err:
 //use ifreq.ifr_flags (short) to exchange info. IS IT OK?		
 static int nrf24_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
-	int		res;
 	struct nrf24_data	*nrf24=netdev_priv(dev);
 	
 	switch (cmd) {
@@ -327,8 +326,7 @@ static int nrf24_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	default:
 		break;
 	}
-out:
-	return res;
+	return 0;
 }
 
 static int nrf24_set_mac_address(struct net_device *dev, void *addr)
@@ -356,11 +354,11 @@ static int nrf24_open(struct net_device *dev)
 	CHECKOUT(set_register(nrf24,RX_ADDR_P4,*(dev->dev_addr+12)),res,out)
 	CHECKOUT(set_register(nrf24,RX_ADDR_P5,*(dev->dev_addr+13)),res,out)
 
-	CHECKOUT(set_channel(nrf24),res,out） //set channel
+	CHECKOUT(set_channel(nrf24),res,out) //set channel
 	CHECKOUT(set_register(nrf24,EN_RXADDR,nrf24->mode),res,out) //set mode(enable pipes)
 
-	enable_irq(nrf24->spi->irq);
 	CHECKOUT(power_switch(nrf24,0),res,out)
+	enable_irq(nrf24->spi->irq);
 	
 	netif_start_queue(dev);
 	CE_H;
@@ -374,8 +372,8 @@ static int nrf24_stop(struct net_device *dev)
 	int			res;
 	CE_L;
 	netif_stop_queue(dev);
-	CHECKOUT(power_switch(nrf24,0),res,out)
 	disable_irq(nrf24->spi->irq);
+	CHECKOUT(power_switch(nrf24,0),res,out)
 	while ((skb = skb_dequeue(&nrf24->send_queue)))
 		dev_kfree_skb(skb);
 out:
