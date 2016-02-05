@@ -176,7 +176,7 @@ static ssize_t __write_playload(struct nrf24_data * nrf24, char * buf, size_t le
 // only the first 1-33 bytes transmitted, 0 byte is the pipe num
 static ssize_t write_payload(struct nrf24_data *nrf24)
 {
-	u8 pipe,res=0;
+	ssize_t res=0;
 	struct sk_buff * skb;
 	while(skb=skb_dequeue(&nrf24->send_queue)){
 		if(skb->len>33){
@@ -245,7 +245,7 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 	do{
 		CHECKOUT(read_payload(nrf24),res,out)
 		pipe=(nrf24->buf[0]>>1) & 0b111;
-		buf[0]=pipe; //set pipe number
+		nrf24->buf[0]=pipe; //set pipe number
 		if (!(skb = netdev_alloc_skb(nrf24->dev,nrf24->len))) {
 			nrf24_msg("%s: memory squeeze, dropping packet\n", nrf24->dev->name);
 			++nrf24->dev->stats.rx_dropped;
@@ -256,7 +256,7 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 			skb->pkt_type=PACKET_HOST;
 			skb->protocol = 0; //no protocol at all
 			skb_reset_mac_header(skb);
-			skb->mac.raw=nrf24->addr[pipe];
+			//skb->mac.raw=nrf24->addr[pipe];
 			skb->ip_summed=CHECKSUM_UNNECESSARY;
 			netif_rx(skb);
 			++nrf24->dev->stats.rx_packets;
@@ -283,7 +283,7 @@ static irqreturn_t nrf24_handler(int irq, void *dev)
 	}else if(status & MAX_RT){ //tx fail, in prx mode this should not happen
 		flush_tx(nrf24);
 		++nrf24->dev->stats.tx_dropped;
-		nrf24_msg("MAX_RT happened...ghost exists")
+		nrf24_msg("MAX_RT happened...ghost exists");
 	}
 	if(status & RX_DR){ //rx ready, read out the payloads
 		receive_packet(nrf24);
