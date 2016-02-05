@@ -30,3 +30,10 @@
 
 # Debug files
 *.dSYM/
+
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+*.mod.c
+
