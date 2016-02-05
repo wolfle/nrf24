@@ -190,6 +190,7 @@ static ssize_t write_payload(struct nrf24_data *nrf24)
 		CHECKOUT(read_status(nrf24),res,out)
 		if(nrf24->buf[0]&0x1)break; //TX_FULL
 	}
+	if(nrf24->send_queue.qlen<8)netif_wake_queue(nrf24->dev); //if qlen < 8 enable the socket send traffic
 out:	
 	return res;
 }
@@ -235,6 +236,7 @@ static netdev_tx_t nrf24_send_packet(struct sk_buff *skb,struct net_device *dev)
 
 	skb_queue_tail(&nrf24->send_queue, skb);
 	dev->trans_start = jiffies;
+	if(nrf24->send_queue.qlen>8)netif_stop_queue(dev); //if qlen > 8 throttle the socket
 	return NETDEV_TX_OK;
 }
 
