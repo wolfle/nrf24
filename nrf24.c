@@ -178,7 +178,7 @@ static ssize_t write_payload(struct nrf24_data *nrf24)
 {
 	u8 pipe,res=0;
 	struct sk_buff * skb;
-	while(skb=skb_dequeue(nrf24->send_queue)){
+	while(skb=skb_dequeue(&nrf24->send_queue)){
 		if(skb->len>33){
 			nrf24_msg("Packet too big.");
 			skb->len=33;
@@ -207,14 +207,14 @@ static ssize_t read_payload(struct nrf24_data *nrf24)
 	CHECKOUT(get_payload_size(nrf24),res,out);
 	nrf24->buf[0]=R_RX_PAYLOAD;
 	nrf24->len=1+nrf24->buf[1];
-	CHECKOUT(__spi_trans(nrf24,buf,len),res,out);
+	CHECKOUT(__spi_trans(nrf24,nrf24->buf,nrf24->len),res,out);
 out:
 	return res;
 }
 
 static inline ssize_t set_channel(struct nrf24_data * nrf24)
 {
-	return set_register(nrf24, RF_CH, nrf24->channel<126?nrf24->channel:126); //max channel is 127,use 126 for wide channel
+	return set_register(nrf24, RF_CH, nrf24->ch<126?nrf24->ch:126); //max channel is 127,use 126 for wide channel
 }
 
 static inline ssize_t power_switch(struct nrf24_data * nrf24, u8 powerup){
@@ -228,17 +228,18 @@ out:
 }
 
 static netdev_tx_t nrf24_send_packet(struct sk_buff *skb,struct net_device *dev){
-	struct priv_data *priv = netdev_priv(dev);
+	struct nrf24_data *nrf24 = netdev_priv(dev);
 //	if (netif_queue_stopped(dev))
 //		return NETDEV_TX_BUSY;
 //	netif_stop_queue (dev);
 
-	skb_queue_tail(&priv->send_queue, skb);
+	skb_queue_tail(&nrf24->send_queue, skb);
 	dev->trans_start = jiffies;
 	return NETDEV_TX_OK;
 }
 
 static ssize_t receive_packet(struct nrf24_data *nrf24){
+	struct sk_buff * skb;
 	ssize_t res;
 	u8 pipe;
 	do{
@@ -246,7 +247,7 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 		pipe=(nrf24->buf[0]>>1) & 0b111;
 		buf[0]=pipe; //set pipe number
 		if (!(skb = netdev_alloc_skb(nrf24->dev,nrf24->len))) {
-			nrf24_msg("%s: memory squeeze, dropping packet\n", dev->name);
+			nrf24_msg("%s: memory squeeze, dropping packet\n", nrf24->dev->name);
 			++nrf24->dev->stats.rx_dropped;
 			res=-ENOMEM;
 			break;
@@ -255,7 +256,7 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 			skb->pkt_type=PACKET_HOST;
 			skb->protocol = 0; //no protocol at all
 			skb_reset_mac_header(skb);
-			skb->mac.raw=addr[pipe];
+			skb->mac.raw=nrf24->addr[pipe];
 			skb->ip_summed=CHECKSUM_UNNECESSARY;
 			netif_rx(skb);
 			++nrf24->dev->stats.rx_packets;
@@ -278,11 +279,10 @@ static irqreturn_t nrf24_handler(int irq, void *dev)
 	status=nrf24->buf[0];
 	//what happened
 	if(status & TX_DS){ //tx ok, push tx payloads if available, else do nothing
-		CHECKOUT(write_payload(nrf24,0),res,err)
+		CHECKOUT(write_payload(nrf24),res,err)
 	}else if(status & MAX_RT){ //tx fail, in prx mode this should not happen
 		flush_tx(nrf24);
 		++nrf24->dev->stats.tx_dropped;
-		state |= TX_FAIL;
 		nrf24_msg("MAX_RT happened...ghost exists")
 	}
 	if(status & RX_DR){ //rx ready, read out the payloads
@@ -298,7 +298,7 @@ err:
 }
 
 //use ifreq.ifr_flags (short) to exchange info. IS IT OK?		
-static int nrf_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+static int nrf24_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
 	int		res;
 	struct nrf24_data	*nrf24=netdev_priv(dev);
@@ -336,16 +336,15 @@ static int nrf24_set_mac_address(struct net_device *dev, void *addr)
 	struct sockaddr *sa = (struct sockaddr *) addr;
 	if(dev->flags&IFF_UP)return -EBUSY;
 	memcpy(dev->dev_addr, sa->sa_data, dev->addr_len);
-	return 0
-	return res;
+	return 0;
 }
 
 static int nrf24_open(struct net_device *dev)
 {
-	int			ret ;
+	int			res ;
 	struct nrf24_data	*nrf24=netdev_priv(dev);
 
-	if(dev->dev_addr[0]==0 || mode == 0)return -EINVAL;
+	if(dev->dev_addr[0]==0 || nrf24->mode == 0)return -EINVAL;
 	
 	//set pipe address according to dev_addr
 	memcpy(nrf24->buf+1,dev->dev_addr,5);
@@ -361,29 +360,29 @@ static int nrf24_open(struct net_device *dev)
 	CHECKOUT(set_register(nrf24,EN_RXADDR,nrf24->mode),res,out) //set mode(enable pipes)
 
 	enable_irq(nrf24->spi->irq);
-	CHECKOUT(power_switch(nrf24,0),ret,out)
+	CHECKOUT(power_switch(nrf24,0),res,out)
 	
 	netif_start_queue(dev);
 	CE_H;
 out:
-	return ret;
+	return res;
 }
 
 static int nrf24_stop(struct net_device *dev)
 {
 	struct nrf24_data	*nrf24=netdev_priv(dev);
-	int			ret;
+	int			res;
 	CE_L;
 	netif_stop_queue(dev);
-	CHECKOUT(power_switch(nrf24,0),ret,out)
+	CHECKOUT(power_switch(nrf24,0),res,out)
 	disable_irq(nrf24->spi->irq);
 	while ((skb = skb_dequeue(&nrf24->send_queue)))
 		dev_kfree_skb(skb);
 out:
-	return ret;
+	return res;
 }
 
-struct net_device_stats *nrf24_stats(struct net_device *dev)
+static struct net_device_stats *nrf24_stats(struct net_device *dev)
 {
 	return &dev->stats;
 }
