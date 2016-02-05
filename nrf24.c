@@ -288,8 +288,9 @@ static irqreturn_t nrf24_handler(int irq, void *dev)
 	if(status & RX_DR){ //rx ready, read out the payloads
 		receive_packet(nrf24);
 	}
-out:
+
 	CHECKOUT(set_register(nrf24,STATUS,status),res,err); // clear status register
+out:
 	CE_H;
 	return IRQ_HANDLED;
 err:
@@ -369,6 +370,7 @@ out:
 static int nrf24_stop(struct net_device *dev)
 {
 	struct nrf24_data	*nrf24=netdev_priv(dev);
+	struct sk_buff * skb;
 	int			res;
 	CE_L;
 	netif_stop_queue(dev);
@@ -387,7 +389,7 @@ static struct net_device_stats *nrf24_stats(struct net_device *dev)
 
 static const struct net_device_ops netdev_ops = {
 	.ndo_open	     = nrf24_open,
-	.ndo_stop	     = nrf24_close,
+	.ndo_stop	     = nrf24_stop,
 	.ndo_start_xmit      = nrf24_send_packet,
 	.ndo_do_ioctl 	     = nrf24_ioctl,
 	.ndo_set_mac_address = nrf24_set_mac_address,
@@ -422,7 +424,7 @@ static ssize_t __init nrf24_initialize(struct nrf24_data * nrf24)
 {
 	ssize_t retval;
 	
-	CHECKOUT(nrf24_reset(nrf24),retval,mem); //detect presence of nrf24l01+
+	CHECKOUT(nrf24_reset(nrf24),retval,out); //detect presence of nrf24l01+
 /*	
 	CHECKOUT(set_register(nrf24,SETUP_RETR,(1 << ARD) | (0b111 << ARC)),retval,out); //500us; retransmit 7 times
 #ifdef NRF24_DEBUG
@@ -436,7 +438,7 @@ static ssize_t __init nrf24_initialize(struct nrf24_data * nrf24)
 	if(nrf24->buf[1] != 0b1111) nrf24_msg("Set RF_SETUP failed! %#x",nrf24->buf[1]);
 #endif	
 	nrf24->ch=76;
-	CHECKOUT(set_channel(nrf24,nrf24->ch),retval,out);
+	CHECKOUT(set_channel(nrf24),retval,out);
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,RF_CH),retval,out); 
 	if(nrf24->buf[1] != nrf24->ch) nrf24_msg("Set RF_CH failed! %#x",nrf24->buf[1]);
@@ -473,10 +475,6 @@ static ssize_t __init nrf24_initialize(struct nrf24_data * nrf24)
 	if(nrf24->buf[1] != 0b11) nrf24_msg("Set SETUP_AW failed! %#x",nrf24->buf[0]);
 #endif	
 	
-	memcpy(nrf24->buf+1,nrf24->a0,5);
-	CHECKOUT(set_address(nrf24,RX_ADDR_P0),retval,out); 
-	CHECKOUT(set_address(nrf24,TX_ADDR),retval,out);
-		
 	CHECKOUT(request_threaded_irq(nrf24->spi->irq, NULL, nrf24_handler, IRQF_TRIGGER_FALLING, "nRF24L01+", nrf24),retval,out)
 	
 	nrf24_msg("Initialized.\n");
@@ -489,7 +487,7 @@ out:
 
 static void dev_setup(struct net_device *dev){
 	struct nrf24_data * nrf24=netdev_priv(dev);
-	dev->netdev_ops = &snull_netdev_ops;
+	dev->netdev_ops = &netdev_ops;
 	dev->flags           |= IFF_NOARP|IFF_POINTOPOINT;
 	dev->features        |= NETIF_F_HW_CSUM;
 	dev->watchdog_timeo = TIMEOUT;
@@ -500,7 +498,12 @@ static void dev_setup(struct net_device *dev){
 	dev->tx_queue_len=10;
 	nrf24->dev=dev;
 	skb_queue_head_init(&nrf24->send_queue);
-	nrf24->addr[]={dev->dev_addr,dev->dev_addr+5,dev->dev_addr+10,dev->dev_addr+11,dev->dev_addr+12,dev->dev_addr+13};
+	nrf24->addr[0]=dev->dev_addr;
+	nrf24->addr[1]=dev->dev_addr+5;
+	nrf24->addr[2]=dev->dev_addr+10;
+	nrf24->addr[3]=dev->dev_addr+11;
+	nrf24->addr[4]=dev->dev_addr+12;
+	nrf24->addr[5]=dev->dev_addr+13;
 }
 
 static int __devinit nrf24_probe(struct spi_device *spi)
@@ -542,7 +545,7 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 //	spin_unlock_irq(&nrf24->spi_lock);
 
 	if (spi == NULL){
-		retval = -ESHUTDOWN;
+		status = -ESHUTDOWN;
 		goto mem;
 	}
 	
@@ -581,7 +584,7 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 	
 	//free_irq(spi->irq,nrf24);
 	gpio_free_array(gpios,ARRAY_SIZE(gpios));
-	free_irq(spi->irq); //Should we free irq here?
+	//free_irq(spi->irq); //Should we free irq here?
 	
 	nrf24_msg("Removed.\n");
 	return 0;
