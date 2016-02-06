@@ -25,7 +25,6 @@
 #include <linux/in.h>
 #include <linux/if.h>
 #include <linux/module.h>
-#include <linux/ioctl.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/list.h>
@@ -37,18 +36,12 @@
 #include <linux/spi/spi.h>
 #include <linux/gpio.h>
 #include <linux/interrupt.h>
-#include <linux/workqueue.h>
-#include <linux/poll.h>
-#include <asm/barrier.h>
 
 #include <linux/netdevice.h>
 #include <linux/if_arp.h>
-#include <linux/etherdevice.h>
 #include <linux/skbuff.h>
 
 #include <asm/uaccess.h>
-
-#include <plat/sys_config.h>
 
 #include "nrf24l01.h"
 #include "nrf24.h"

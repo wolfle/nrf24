@@ -1,6 +1,6 @@
 #ifndef _NRF24_H_
 #define _NRF24_H_
-
+#include <linux/sockios.h>
 //#define TIMEOUT HZ*2  //2 seconds
 
 //netdev driver ioctl commands
