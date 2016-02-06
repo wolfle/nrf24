@@ -528,7 +528,8 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 	/* Allocate driver data */
 	dev = alloc_netdev(sizeof(struct nrf24_data), "nrf%d"/*, NET_NAME_ENUM*/, dev_setup);
 	if(!dev){
-		dev_dbg(&nrf24->spi->dev, "probe/ENOMEM\n");
+		nrf24_msg("Allocate net dev failed.\n");
+//		dev_dbg(&spi->dev, "probe/ENOMEM\n");
 		status=-ENOMEM;
 		goto gpio;
 	}
@@ -586,7 +587,7 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 	
 	//free_irq(spi->irq,nrf24);
 	gpio_free_array(gpios,ARRAY_SIZE(gpios));
-	//free_irq(spi->irq); //Should we free irq here?
+	//free_irq(spi->irq,spi); //Should we free irq here?
 	
 	nrf24_msg("Removed.\n");
 	return 0;
