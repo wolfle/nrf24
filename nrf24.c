@@ -63,7 +63,6 @@ struct nrf24_data {
 	int			ce_gpio;
 	/* buf and len used for spi transfers*/
 	u8			buf[32+1], len, ch, mode;//rf channel and enable flags of pipes
-	unsigned char *addr[6];//={dev->dev_addr,dev->dev_addr+5,dev->dev_addr+10,dev->dev_addr+11,dev->dev_addr+12,dev->dev_addr+13};
 };
 
 static unsigned int ce_gpio = 6; //FIXME
@@ -249,9 +248,8 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 		} else {
 			memcpy(skb_put(skb, nrf24->len), nrf24->buf, nrf24->len);
 			skb->pkt_type=PACKET_HOST;
-			skb->protocol = 0; //no protocol at all
+			skb->protocol = ETH_P_NRF24; //no protocol at all
 			skb_reset_mac_header(skb);
-			//skb->mac.raw=nrf24->addr[pipe];
 			skb->ip_summed=CHECKSUM_UNNECESSARY;
 			netif_rx(skb);
 			++nrf24->dev->stats.rx_packets;
@@ -492,12 +490,6 @@ static void dev_setup(struct net_device *dev){
 	dev->tx_queue_len=10;
 	nrf24->dev=dev;
 	skb_queue_head_init(&nrf24->send_queue);
-	nrf24->addr[0]=dev->dev_addr;
-	nrf24->addr[1]=dev->dev_addr+5;
-	nrf24->addr[2]=dev->dev_addr+10;
-	nrf24->addr[3]=dev->dev_addr+11;
-	nrf24->addr[4]=dev->dev_addr+12;
-	nrf24->addr[5]=dev->dev_addr+13;
 }
 
 static int __devinit nrf24_probe(struct spi_device *spi)
