@@ -248,7 +248,7 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 		} else {
 			memcpy(skb_put(skb, nrf24->len), nrf24->buf, nrf24->len);
 			skb->pkt_type=PACKET_HOST;
-			skb->protocol = ETH_P_NRF24; //no protocol at all
+			skb->protocol = htons(ETH_P_NRF24);
 			skb_reset_mac_header(skb);
 			skb->ip_summed=CHECKSUM_UNNECESSARY;
 			netif_rx(skb);
