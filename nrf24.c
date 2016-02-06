@@ -178,7 +178,7 @@ static ssize_t write_payload(struct nrf24_data *nrf24)
 {
 	ssize_t res=0;
 	struct sk_buff * skb;
-	while(skb=skb_dequeue(&nrf24->send_queue)){
+	while((skb=skb_dequeue(&nrf24->send_queue))){
 		if(skb->len>33){
 			nrf24_msg("Packet too big.");
 			skb->len=33;
@@ -361,7 +361,8 @@ static int nrf24_open(struct net_device *dev)
 	CHECKOUT(set_register(nrf24,EN_RXADDR,nrf24->mode),res,out) //set mode(enable pipes)
 
 	CHECKOUT(power_switch(nrf24,0),res,out)
-	enable_irq(nrf24->spi->irq);
+	//enable_irq(nrf24->spi->irq);
+	CHECKOUT(request_threaded_irq(dev->irq, NULL, nrf24_handler, IRQF_TRIGGER_FALLING, "nRF24L01+", nrf24),res,out)
 	
 	netif_start_queue(dev);
 	CE_H;
@@ -376,7 +377,8 @@ static int nrf24_stop(struct net_device *dev)
 	int			res;
 	CE_L;
 	netif_stop_queue(dev);
-	disable_irq(nrf24->spi->irq);
+	//disable_irq(nrf24->spi->irq);
+	free_irq(dev->irq,nrf24);
 	CHECKOUT(power_switch(nrf24,0),res,out)
 	while ((skb = skb_dequeue(&nrf24->send_queue)))
 		dev_kfree_skb(skb);
@@ -475,9 +477,7 @@ static ssize_t __init nrf24_initialize(struct nrf24_data * nrf24)
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,SETUP_AW),retval,out); 
 	if(nrf24->buf[1] != 0b11) nrf24_msg("Set SETUP_AW failed! %#x",nrf24->buf[0]);
-#endif	
-	
-	CHECKOUT(request_threaded_irq(nrf24->spi->irq, NULL, nrf24_handler, IRQF_TRIGGER_FALLING, "nRF24L01+", nrf24),retval,out)
+#endif
 	
 	nrf24_msg("Initialized.\n");
 out:
@@ -493,7 +493,6 @@ static void dev_setup(struct net_device *dev){
 	dev->flags           |= IFF_NOARP|IFF_POINTOPOINT;
 	dev->features        |= NETIF_F_HW_CSUM;
 	//dev->watchdog_timeo = TIMEOUT;
-	dev->irq = nrf24->spi->irq;
 	dev->type = ARPHRD_NONE;
 	dev->mtu = 32+1;
 	dev->addr_len = 5+5+1+1+1+1;
@@ -524,7 +523,6 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 	// Is toggling it right?
 //		gpio_direction_input(nrf24->cs_gpio);
 //		if(gpio_direction_output(nrf24->cs_gpio, 0) < 0) goto out;
-	
 	/* Allocate driver data */
 	dev = alloc_netdev(sizeof(struct nrf24_data), "nrf%d"/*, NET_NAME_ENUM*/, dev_setup);
 	if(!dev){
@@ -534,14 +532,14 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 		goto gpio;
 	}
 	nrf24 = netdev_priv(dev);
-
 	/* Initialize the spi driver data */
 	nrf24->ce_gpio=ce_gpio; 
 
 	nrf24->spi = spi;
 	spi_set_drvdata(spi, nrf24);
 		
-	disable_irq(nrf24->spi->irq);
+	//disable_irq(nrf24->spi->irq);
+	dev->irq = nrf24->spi->irq;
 	// spi init
 //	spin_lock_irq(&nrf24->spi_lock);
 	spi = spi_dev_get(nrf24->spi);
@@ -556,7 +554,6 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 	spi_dev_put(spi);
 
 	CHECKOUT(nrf24_initialize(nrf24),status,mem);
-	
 	CHECKOUT(register_netdev(dev),status,mem);
 	
 	return status;
@@ -585,9 +582,7 @@ static int __devexit nrf24_remove(struct spi_device *spi)
 	unregister_netdev(nrf24->dev);
 	free_netdev(nrf24->dev);
 	
-	//free_irq(spi->irq,nrf24);
 	gpio_free_array(gpios,ARRAY_SIZE(gpios));
-	//free_irq(spi->irq,spi); //Should we free irq here?
 	
 	nrf24_msg("Removed.\n");
 	return 0;
