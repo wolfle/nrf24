@@ -305,7 +305,9 @@ static int nrf24_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 		ifr->ifr_flags=nrf24->mode;
 		break;
 	case GET_RPD:
+		if(dev->flags&IFF_UP)return -EBUSY;
 		ifr->ifr_flags=read_rpd(nrf24);
+		if(ifr->ifr_flags==-1)return -ENODEV;
 		break;
 	/* write requests */
 	case SET_CHANNEL:
