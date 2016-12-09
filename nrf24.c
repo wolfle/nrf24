@@ -227,7 +227,7 @@ static netdev_tx_t nrf24_send_packet(struct sk_buff *skb,struct net_device *dev)
 //	netif_stop_queue (dev);
 
 	skb_queue_tail(&nrf24->send_queue, skb);
-	dev->trans_start = jiffies;
+	netif_trans_update(dev);//dev->trans_start = jiffies;  x = dev_trans_start(dev) to read the saved jiffies
 	if(nrf24->send_queue.qlen>8)netif_stop_queue(dev); //if qlen > 8 throttle the socket
 	return NETDEV_TX_OK;
 }
@@ -494,7 +494,7 @@ static void dev_setup(struct net_device *dev){
 	skb_queue_head_init(&nrf24->send_queue);
 }
 
-static int __devinit nrf24_probe(struct spi_device *spi)
+static int __init nrf24_probe(struct spi_device *spi)
 {
 	struct net_device *dev;
 	struct nrf24_data	*nrf24;
@@ -511,7 +511,7 @@ static int __devinit nrf24_probe(struct spi_device *spi)
 //		gpio_direction_input(nrf24->cs_gpio);
 //		if(gpio_direction_output(nrf24->cs_gpio, 0) < 0) goto out;
 	/* Allocate driver data */
-	dev = alloc_netdev(sizeof(struct nrf24_data), "nrf%d"/*, NET_NAME_ENUM*/, dev_setup);
+	dev = alloc_netdev(sizeof(struct nrf24_data), "nrf%d", NET_NAME_ENUM,dev_setup);
 	if(!dev){
 		nrf24_msg("Allocate net dev failed.\n");
 //		dev_dbg(&spi->dev, "probe/ENOMEM\n");
@@ -551,7 +551,7 @@ gpio:
 	return status;
 }
 
-static int __devexit nrf24_remove(struct spi_device *spi)
+static int __exit nrf24_remove(struct spi_device *spi)
 {
 	struct nrf24_data	*nrf24 = spi_get_drvdata(spi);
 
@@ -581,7 +581,7 @@ static struct spi_driver nrf24_spi_driver = {
 		.owner =	THIS_MODULE,
 	},
 	.probe =	nrf24_probe,
-	.remove =	__devexit_p(nrf24_remove),
+	.remove =	__exit_p(nrf24_remove),
 
 	/* NOTE:  suspend/resume methods are not necessary here.
 	 * We don't do anything except pass the requests to/from
