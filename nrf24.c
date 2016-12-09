@@ -1,9 +1,8 @@
 /*
- * Simple synchronous userspace interface to SPI devices
+ * Simple network device driver for nrf24l01+ the SPI rf devices
  *
- * Copyright (C) 2006 SWAPP
- *	Andrea Paterniani <a.paterniani@swapp-eng.it>
- * Copyright (C) 2007 David Brownell (simplification, cleanup)
+ * Copyright (C) 2016 Wolfle
+ *	Bob Guo <wolfle@softhome.net>
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -43,6 +42,10 @@
 
 #include <asm/uaccess.h>
 
+#include <linux/of.h>
+#include <linux/of_gpio.h>
+
+
 #include "nrf24l01.h"
 #include "nrf24.h"
 
@@ -65,19 +68,13 @@ struct nrf24_data {
 	u8			buf[32+1], len, ch, mode;//rf channel and enable flags of pipes
 };
 
-static unsigned int ce_gpio = 6; //FIXME
-
-module_param(ce_gpio, uint, S_IRUGO); //FIXME
-MODULE_PARM_DESC(ce_gpio, "Gpio pin number for nrf24l01+ chip enable");//FIXME
-
 /*-------------------------------------------------------------------------*/
 
 #define CHECKOUT(x,r,o) if((r=(x))<0)goto o;
 #define CE_H 	gpio_set_value(nrf24->ce_gpio,1)
 #define CE_L	gpio_set_value(nrf24->ce_gpio,0)
 
-/* 
- * logical read through spi. reading command at head of the buffer. 
+/*  
  * len should be the sum of reading command and the expected readin data length.
  * real full duplex needed
  */
@@ -172,10 +169,16 @@ static ssize_t write_payload(struct nrf24_data *nrf24)
 	struct sk_buff * skb;
 	while((skb=skb_dequeue(&nrf24->send_queue))){
 		if(skb->len>33){
-			nrf24_msg("Packet too big.");
+			nrf24_msg("Packet too big. Truncated.");
 			skb->len=33;
 		}
-		CHECKOUT(__write_playload(nrf24,skb->head,skb->len),res,out) //pipe in head[0]
+		if(skb->head[0]>5){
+			nrf24_msg("Invalid pipe number: %u, packet dropped.",skb->head[0]);
+			++nrf24->dev->stats.tx_dropped;
+		}else{
+			CHECKOUT(__write_playload(nrf24,skb->head,skb->len),res,out) //pipe in head[0]
+			++nrf24->dev->stats.tx_packets;
+		}
 		//memcpy(nrf24->buf,skb->data,skb->len);
 		//skb_pull(skb,skb->len);
 		dev_kfree_skb_any(skb);
@@ -193,14 +196,21 @@ static inline ssize_t get_payload_size(struct nrf24_data *nrf24)
 	nrf24->len=2;
 	return nrf24_spi_trans(nrf24);
 }
-//payload start at buf[1], length=len-1
+//payload start at buf[1], length=len-1, status reg in buf[0]
 static ssize_t read_payload(struct nrf24_data *nrf24)
 {
 	ssize_t res;
 	CHECKOUT(get_payload_size(nrf24),res,out);
+	if(nrf24->buf[1]>32){ //invalid payload size found
+		flush_rx(nrf24);
+		++nrf24->dev->stats.rx_dropped;
+		nrf24_msg("Invalid payload length: %u, rx packets dropped.",nrf24->buf[1]);
+		res=-EINVAL;
+		goto out;
+	}
 	nrf24->buf[0]=R_RX_PAYLOAD;
 	nrf24->len=1+nrf24->buf[1];
-	CHECKOUT(__spi_trans(nrf24,nrf24->buf,nrf24->len),res,out);
+	res=nrf24_spi_trans(nrf24);
 out:
 	return res;
 }
@@ -254,9 +264,9 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 			netif_rx(skb);
 			++nrf24->dev->stats.rx_packets;
 			nrf24->dev->last_rx=jiffies;
-			CHECKOUT(read_status(nrf24),res,out)
-			pipe=(nrf24->buf[0]>>1) & 0b111;
 		}
+		CHECKOUT(read_status(nrf24),res,out)
+		pipe=(nrf24->buf[0]>>1) & 0b111;
 	}while(pipe!=0b111);
 out:
 	return res;
@@ -267,7 +277,7 @@ static irqreturn_t nrf24_handler(int irq, void *dev)
 	int res;
 	u8 status;
 	struct nrf24_data * nrf24 = (struct nrf24_data *)dev;
-	CE_L;
+	//CE_L;
 	CHECKOUT(read_status(nrf24),res,err);
 	status=nrf24->buf[0];
 	//what happened
@@ -282,9 +292,9 @@ static irqreturn_t nrf24_handler(int irq, void *dev)
 		receive_packet(nrf24);
 	}
 
-	CHECKOUT(set_register(nrf24,STATUS,status),res,err); // clear status register
+	CHECKOUT(set_register(nrf24,STATUS,0x70),res,err); // clear status register
 out:
-	CE_H;
+	//CE_H;
 	return IRQ_HANDLED;
 err:
 	nrf24_msg("SPI transfer error: %d",res);
@@ -353,7 +363,7 @@ static int nrf24_open(struct net_device *dev)
 	CHECKOUT(set_channel(nrf24),res,out) //set channel
 	CHECKOUT(set_register(nrf24,EN_RXADDR,nrf24->mode),res,out) //set mode(enable pipes)
 
-	CHECKOUT(power_switch(nrf24,0),res,out)
+	CHECKOUT(power_switch(nrf24,1),res,out)
 	//enable_irq(nrf24->spi->irq);
 	CHECKOUT(request_threaded_irq(dev->irq, NULL, nrf24_handler, IRQF_TRIGGER_FALLING, "nRF24L01+", nrf24),res,out)
 	
@@ -422,13 +432,13 @@ static ssize_t __init nrf24_initialize(struct nrf24_data * nrf24)
 	ssize_t retval;
 	
 	CHECKOUT(nrf24_reset(nrf24),retval,out); //detect presence of nrf24l01+
-/*	
-	CHECKOUT(set_register(nrf24,SETUP_RETR,(1 << ARD) | (0b111 << ARC)),retval,out); //500us; retransmit 7 times
+	//FIXME: is it neccesary to set ard and arc for prx mode?
+	CHECKOUT(set_register(nrf24,SETUP_RETR,(1 << ARD) | (0b101 << ARC)),retval,out); //500us; retransmit 5 times
 #ifdef NRF24_DEBUG
-	CHECKOUT(read_register(nrf24,SETUP_RETR),retval,out); //500us; retransmit 7 times
-	if(nrf24->buf[1] != ((1 << ARD) | (0b111 << ARC)) )nrf24_msg("Set SETUP_RETR failed! %#x",nrf24->buf[1]);
+	CHECKOUT(read_register(nrf24,SETUP_RETR),retval,out);
+	if(nrf24->buf[1] != ((1 << ARD) | (0b101 << ARC)) )nrf24_msg("Set SETUP_RETR failed! %#x",nrf24->buf[1]);
 #endif	
-*/
+
 	CHECKOUT(set_register(nrf24,RF_SETUP,0b1111),retval,out); //PA max,  2Mbps
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,RF_SETUP),retval,out); 
@@ -471,6 +481,13 @@ static ssize_t __init nrf24_initialize(struct nrf24_data * nrf24)
 	CHECKOUT(read_register(nrf24,SETUP_AW),retval,out); 
 	if(nrf24->buf[1] != 0b11) nrf24_msg("Set SETUP_AW failed! %#x",nrf24->buf[0]);
 #endif
+
+	CHECKOUT(set_register(nrf24,RX_PW_P0,32),retval,out); // max rx payload length
+	CHECKOUT(set_register(nrf24,RX_PW_P1,32),retval,out); // max rx payload length
+	CHECKOUT(set_register(nrf24,RX_PW_P2,32),retval,out); // max rx payload length
+	CHECKOUT(set_register(nrf24,RX_PW_P3,32),retval,out); // max rx payload length
+	CHECKOUT(set_register(nrf24,RX_PW_P4,32),retval,out); // max rx payload length
+	CHECKOUT(set_register(nrf24,RX_PW_P5,32),retval,out); // max rx payload length
 	
 	nrf24_msg("Initialized.\n");
 out:
@@ -480,7 +497,7 @@ out:
 
 /*-------------------------------------------------------------------------*/
 
-static void dev_setup(struct net_device *dev){
+static void __init dev_setup(struct net_device *dev){
 	struct nrf24_data * nrf24=netdev_priv(dev);
 	dev->netdev_ops = &netdev_ops;
 	dev->flags           |= IFF_NOARP|IFF_POINTOPOINT;
@@ -498,14 +515,30 @@ static int __init nrf24_probe(struct spi_device *spi)
 {
 	struct net_device *dev;
 	struct nrf24_data	*nrf24;
-	int			status=0;
+	struct device_node *on = spi->dev.of_node;
+	int			gpio_irq, status=0;
+	struct gpio gpios[1];
 
-	struct gpio gpios[]={
-		{ce_gpio,GPIOF_OUT_INIT_LOW,"nrf24 chip enable"},
-	};
+	//get params from device tree
+	if(!on){
+		nrf24_msg("No device node found in device tree.");
+		return -ENODEV;
+	}
 	
-	if(spi->irq < 0 || ce_gpio < 0) return -ENXIO;
-	
+	gpio_irq = of_get_named_gpio(on, "gpio-irq", 0);
+	nrf24->ce_gpio  = of_get_named_gpio(on, "gpio-ce", 0);
+
+	if(gpio_irq<0 || nrf24->ce_gpio<0){
+		nrf24_msg("No gpio-irq or gpio-ce in device tree node.");
+		return -ENODEV;
+	}
+		
+	spi->irq=gpio_to_irq(gpio_irq);
+	if(spi->irq<0){
+		nrf24_msg("Invalid irq for gpio-irq.");
+		return -ENODEV;
+	}
+	gpios[0]=(struct gpio){nrf24->ce_gpio,GPIOF_OUT_INIT_LOW,"nrf24 chip enable"};
 	if(gpio_request_array(gpios,ARRAY_SIZE(gpios)))return -ENXIO;
 	// Is toggling it right?
 //		gpio_direction_input(nrf24->cs_gpio);
@@ -520,13 +553,12 @@ static int __init nrf24_probe(struct spi_device *spi)
 	}
 	nrf24 = netdev_priv(dev);
 	/* Initialize the spi driver data */
-	nrf24->ce_gpio=ce_gpio; 
 
 	nrf24->spi = spi;
 	spi_set_drvdata(spi, nrf24);
 		
 	//disable_irq(nrf24->spi->irq);
-	dev->irq = nrf24->spi->irq;
+	dev->irq = spi->irq;
 	// spi init
 //	spin_lock_irq(&nrf24->spi_lock);
 	spi = spi_dev_get(nrf24->spi);
