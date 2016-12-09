@@ -286,6 +286,7 @@ static irqreturn_t nrf24_handler(int irq, void *dev)
 	}else if(status & MAX_RT){ //tx fail, in prx mode this should not happen
 		flush_tx(nrf24);
 		++nrf24->dev->stats.tx_dropped;
+		--nrf24->dev->stats.tx_packets;
 		nrf24_msg("MAX_RT happened...ghost exists");
 	}
 	if(status & RX_DR){ //rx ready, read out the payloads
