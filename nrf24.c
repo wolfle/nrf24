@@ -63,7 +63,7 @@ struct nrf24_data {
 	struct spi_device	*spi;
 	struct net_device *dev;
 	struct sk_buff_head send_queue;		/* Packets awaiting transmission */
-	int			ce_gpio;
+	int			ce_gpio, irq_gpio;
 	/* buf and len used for spi transfers*/
 	u8			buf[32+1], len, ch, mode;//rf channel and enable flags of pipes
 };
@@ -302,6 +302,7 @@ err:
 	goto out;
 }
 
+//Only when the interface is down can the channel or addresses or mode be changed
 //use ifreq.ifr_flags (short) to exchange info. IS IT OK?		
 static int nrf24_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
@@ -386,6 +387,7 @@ static int nrf24_stop(struct net_device *dev)
 	CHECKOUT(power_switch(nrf24,0),res,out)
 	while ((skb = skb_dequeue(&nrf24->send_queue)))
 		dev_kfree_skb(skb);
+	
 out:
 	return res;
 }
@@ -517,37 +519,51 @@ static int __init nrf24_probe(struct spi_device *spi)
 	struct net_device *dev;
 	struct nrf24_data	*nrf24;
 	struct device_node *on = spi->dev.of_node;
-	int			gpio_irq, status=0;
-	struct gpio gpios[1];
+	int			gpio_irq, gpio_ce, status=0;
 
 	//get params from device tree
 	if(!on){
-		nrf24_msg("No device node found in device tree.");
+		dev_err(&spi->dev,"No device node found in device tree.\n");
 		return -ENODEV;
 	}
 	
 	gpio_irq = of_get_named_gpio(on, "gpio-irq", 0);
-	nrf24->ce_gpio  = of_get_named_gpio(on, "gpio-ce", 0);
+	gpio_ce  = of_get_named_gpio(on, "gpio-ce", 0);
 
-	if(gpio_irq<0 || nrf24->ce_gpio<0){
-		nrf24_msg("No gpio-irq or gpio-ce in device tree node.");
-		return -ENODEV;
+	if(gpio_irq==-EPROBE_DEFER || gpio_ce==-EPROBE_DEFER)
+		return -EPROBE_DEFER;
+
+	if(gpio_irq<0 || gpio_ce<0){
+		dev_err(&spi->dev,"No gpio-irq or gpio-ce in device tree node.\n");
+		return -ENXIO;
 	}
 		
+	if(gpio_is_valid(gpio_ce)){
+		if(devm_gpio_request_one(&spi->dev,gpio_ce,GPIOF_OUT_INIT_LOW,"nrf24 chip enable")){
+			dev_err(&spi->dev, "gpio ce request failed.\n");
+			return -ENXIO;
+		}
+	}
+	if(gpio_is_valid(gpio_irq)){
+		if(devm_gpio_request_one(&spi->dev,gpio_irq,GPIOF_IN,"nrf24 irq")){
+			dev_err(&spi->dev, "gpio irq request failed.\n");
+			status=-ENXIO;
+			goto gpio;
+		}
+	}
 	spi->irq=gpio_to_irq(gpio_irq);
 	if(spi->irq<0){
-		nrf24_msg("Invalid irq for gpio-irq.");
-		return -ENODEV;
+		dev_err(&spi->dev,"Invalid irq for gpio-irq.\n");
+		status=-ENXIO;
+		goto gpio1;
 	}
-	gpios[0]=(struct gpio){nrf24->ce_gpio,GPIOF_OUT_INIT_LOW,"nrf24 chip enable"};
-	if(gpio_request_array(gpios,ARRAY_SIZE(gpios)))return -ENXIO;
 	// Is toggling it right?
 //		gpio_direction_input(nrf24->cs_gpio);
 //		if(gpio_direction_output(nrf24->cs_gpio, 0) < 0) goto out;
 	/* Allocate driver data */
 	dev = alloc_netdev(sizeof(struct nrf24_data), "nrf%d", NET_NAME_ENUM,dev_setup);
 	if(!dev){
-		nrf24_msg("Allocate net dev failed.\n");
+		dev_err(&spi->dev,"Allocate net dev failed.\n");
 //		dev_dbg(&spi->dev, "probe/ENOMEM\n");
 		status=-ENOMEM;
 		goto gpio;
@@ -560,6 +576,8 @@ static int __init nrf24_probe(struct spi_device *spi)
 		
 	//disable_irq(nrf24->spi->irq);
 	dev->irq = spi->irq;
+	nrf24->ce_gpio=gpio_ce;
+	nrf24->irq_gpio=gpio_irq;
 	// spi init
 //	spin_lock_irq(&nrf24->spi_lock);
 	spi = spi_dev_get(nrf24->spi);
@@ -579,18 +597,16 @@ static int __init nrf24_probe(struct spi_device *spi)
 	return status;
 mem:
 	free_netdev(dev);
+gpio1:
+	devm_gpio_free(&spi->dev, gpio_irq);
 gpio:
-	gpio_free_array(gpios,ARRAY_SIZE(gpios));
+	devm_gpio_free(&spi->dev, gpio_ce);
 	return status;
 }
 
 static int __exit nrf24_remove(struct spi_device *spi)
 {
 	struct nrf24_data	*nrf24 = spi_get_drvdata(spi);
-
-	struct gpio gpios[]={
-		{nrf24->ce_gpio,GPIOF_OUT_INIT_LOW,"nrf24 chip enable"},
-	};
 	
 	nrf24_reset(nrf24); //ignore errors
 
@@ -602,40 +618,60 @@ static int __exit nrf24_remove(struct spi_device *spi)
 	unregister_netdev(nrf24->dev);
 	free_netdev(nrf24->dev);
 	
-	gpio_free_array(gpios,ARRAY_SIZE(gpios));
+	devm_gpio_free(&spi->dev, nrf24->irq_gpio);
+	devm_gpio_free(&spi->dev, nrf24->ce_gpio);
 	
 	nrf24_msg("Removed.\n");
 	return 0;
 }
 
-static struct spi_driver nrf24_spi_driver = {
+static int __maybe_unused nrf24_suspend(struct device *dev){
+	struct nrf24_data *nrf24=dev_get_drvdata(dev);
+	CE_L;
+	power_switch(nrf24,0);
+	return 0;
+}
+
+static int __maybe_unused nrf24_resume(struct device *dev){
+	struct nrf24_data *nrf24=dev_get_drvdata(dev);
+//FIXME: if the interface is opened
+	if(netif_running(nrf24->dev)){
+		power_switch(nrf24,1);
+		CE_H; 
+	}
+	return 0;
+}
+
+static SIMPLE_DEV_PM_OPS(nrf24_pm, nrf24_suspend, nrf24_resume);
+
+static const struct spi_device_id nrf24_spi_id[] = {
+	{"nrf24l01+",0},
+	{}
+};
+
+MODULE_DEVICE_TABLE(spi, nrf24_spi_id);
+
+static const struct of_device_id of_nrf24_spi_match[] = {
+	{ .compatible = "nordic,nrf24l01+", },
+	{ .compatible = "nordic,nrf24l01p", },
+	{}
+};
+
+MODULE_DEVICE_TABLE(of, of_nrf24_spi_match);
+
+static struct spi_driver nrf24_spi_driver __refdata = { //FIXME: is this the right way to use __initdata?
 	.driver = {
 		.name =		"nrf24",
 		.owner =	THIS_MODULE,
+		.pm	=	&nrf24_pm,
+		.of_match_table = of_nrf24_spi_match,
 	},
-	.probe =	nrf24_probe,
+	.probe  =	nrf24_probe,
 	.remove =	__exit_p(nrf24_remove),
-
-	/* NOTE:  suspend/resume methods are not necessary here.
-	 * We don't do anything except pass the requests to/from
-	 * the underlying controller.  The refrigerator handles
-	 * most issues; the controller driver handles the rest.
-	 */
+	.id_table = nrf24_spi_id,
 };
 
-/*-------------------------------------------------------------------------*/
-
-static int __init nrf24_init(void)
-{
-	return spi_register_driver(&nrf24_spi_driver);
-}
-module_init(nrf24_init);
-
-static void __exit nrf24_exit(void)
-{
-	spi_unregister_driver(&nrf24_spi_driver);
-}
-module_exit(nrf24_exit);
+module_spi_driver(nrf24_spi_driver);
 
 MODULE_AUTHOR("Bob Guo, <wolfle@yahoo.com>");
 MODULE_DESCRIPTION("nRF24L01+ SPI device interface");
