@@ -35,6 +35,8 @@
 #define FLUSH_TX      0xE1
 #define FLUSH_RX      0xE2
 #define REUSE_TX_PL   0xE3
+#define ACTIVATE	  0x50  //followed by 0x73 activates R_RX_PL_WID,W_ACK_PAYLOAD,W_TX_PAYLOAD_NOACK; only in power off or standby mode
+#define ACTIVATE_MAGIC 0x73
 #define NOP           0xFF
 
 /* Memory Map */

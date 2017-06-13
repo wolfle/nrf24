@@ -3,7 +3,7 @@
 #include <linux/sockios.h>
 //#define TIMEOUT HZ*2  //2 seconds
 
-#define ETH_P_NRF24			0x00FF
+#define ETH_P_NONE			0x00FF
 
 //netdev driver ioctl commands
 #define SET_CHANNEL SIOCDEVPRIVATE //...+15  

@@ -51,11 +51,9 @@
 
 #define NRF24_DEBUG
 
-#ifdef NRF24_DEBUG
-#define nrf24_msg(...)		printk(KERN_WARNING"[nrf24]: "__VA_ARGS__)
-#else
-#define nrf24_msg(...)
-#endif
+#define HIGH_QUEUE_LEN	10
+#define LOW_QUEUE_LEN	8
+
 
 //in skb data, first one byte is pipe number, then the payload data	
 
@@ -76,25 +74,17 @@ struct nrf24_data {
 
 /*  
  * len should be the sum of reading command and the expected readin data length.
- * real full duplex needed
+ * full duplex needed
  */
-static inline ssize_t __spi_trans(struct nrf24_data* nrf24, void *buf, size_t len)
-{
-	struct spi_transfer	t = {
-			.rx_buf		= buf,
-			.tx_buf		= buf,
-			.len		= len,
-		};
-	struct spi_message	m;
-		
-	spi_message_init(&m);
-	spi_message_add_tail(&t, &m);
-	return spi_sync(nrf24->spi, &m);
-}
-
 static inline ssize_t nrf24_spi_trans(struct nrf24_data* nrf24)
 {
-	return __spi_trans(nrf24, nrf24->buf, nrf24->len);
+	struct spi_transfer	t = {
+			.rx_buf		= nrf24->buf,
+			.tx_buf		= nrf24->buf,
+			.len		= nrf24->len,
+		};
+		
+	return spi_sync_transfer(nrf24->spi,&t,1);
 }
 
 static inline ssize_t nrf24_spi_write(struct nrf24_data* nrf24)
@@ -154,6 +144,15 @@ static inline ssize_t flush_rx(struct nrf24_data * nrf24)
 	nrf24->len=1;
 	return nrf24_spi_write(nrf24);
 }
+
+static inline ssize_t activate(struct nrf24_data * nrf24)
+{
+	nrf24->buf[0]=ACTIVATE;
+	nrf24->buf[1]=ACTIVATE_MAGIC;
+	nrf24->len=2;
+	return nrf24_spi_write(nrf24);
+}
+
 /* buf[0] is the pipe number; only for prx mode */
 static ssize_t __write_playload(struct nrf24_data * nrf24, char * buf, size_t len)
 {
@@ -169,11 +168,11 @@ static ssize_t write_payload(struct nrf24_data *nrf24)
 	struct sk_buff * skb;
 	while((skb=skb_dequeue(&nrf24->send_queue))){
 		if(skb->len>33){
-			nrf24_msg("Packet too big. Truncated.");
+			dev_err(&nrf24->spi->dev,"Packet too big. Truncated.");
 			skb->len=33;
 		}
 		if(skb->head[0]>5){
-			nrf24_msg("Invalid pipe number: %u, packet dropped.",skb->head[0]);
+			dev_err(&nrf24->spi->dev,"Invalid pipe number: %u, packet dropped.",skb->head[0]);
 			++nrf24->dev->stats.tx_dropped;
 		}else{
 			CHECKOUT(__write_playload(nrf24,skb->head,skb->len),res,out) //pipe in head[0]
@@ -183,9 +182,9 @@ static ssize_t write_payload(struct nrf24_data *nrf24)
 		//skb_pull(skb,skb->len);
 		dev_kfree_skb_any(skb);
 		CHECKOUT(read_status(nrf24),res,out)
-		if(nrf24->buf[0]&0x1)break; //TX_FULL
+		if(nrf24->buf[0]&TX_FULL)break;
 	}
-	if(nrf24->send_queue.qlen<8)netif_wake_queue(nrf24->dev); //if qlen < 8 enable the socket send traffic
+	if(nrf24->send_queue.qlen<LOW_QUEUE_LEN)netif_wake_queue(nrf24->dev); //if qlen < 8 enable the socket send traffic
 out:	
 	return res;
 }
@@ -200,11 +199,17 @@ static inline ssize_t get_payload_size(struct nrf24_data *nrf24)
 static ssize_t read_payload(struct nrf24_data *nrf24)
 {
 	ssize_t res;
+	
 	CHECKOUT(get_payload_size(nrf24),res,out);
-	if(nrf24->buf[1]>32){ //invalid payload size found
+	if(!nrf24->buf[1]){
+		dev_err(&nrf24->spi->dev,"Zero payload length, deactivated?");
+		activate(nrf24);
+		CHECKOUT(get_payload_size(nrf24),res,out);
+	}
+	if(nrf24->buf[1]>32||!nrf24->buf[1]){ //invalid payload size found
 		flush_rx(nrf24);
 		++nrf24->dev->stats.rx_dropped;
-		nrf24_msg("Invalid payload length: %u, rx packets dropped.",nrf24->buf[1]);
+		if(nrf24->buf[1])dev_err(&nrf24->spi->dev,"Invalid payload length: %u, rx packets dropped.",nrf24->buf[1]);
 		res=-EINVAL;
 		goto out;
 	}
@@ -238,7 +243,7 @@ static netdev_tx_t nrf24_send_packet(struct sk_buff *skb,struct net_device *dev)
 
 	skb_queue_tail(&nrf24->send_queue, skb);
 	netif_trans_update(dev);//dev->trans_start = jiffies;  x = dev_trans_start(dev) to read the saved jiffies
-	if(nrf24->send_queue.qlen>8)netif_stop_queue(dev); //if qlen > 8 throttle the socket
+	if(nrf24->send_queue.qlen>HIGH_QUEUE_LEN)netif_stop_queue(dev);
 	return NETDEV_TX_OK;
 }
 
@@ -251,14 +256,15 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 		pipe=(nrf24->buf[0]>>1) & 0b111;
 		nrf24->buf[0]=pipe; //set pipe number
 		if (!(skb = netdev_alloc_skb(nrf24->dev,nrf24->len))) {
-			nrf24_msg("%s: memory squeeze, dropping packet\n", nrf24->dev->name);
+			dev_err(&nrf24->spi->dev,"memory squeeze, dropping packet\n");
 			++nrf24->dev->stats.rx_dropped;
 			res=-ENOMEM;
 			break;
 		} else {
 			memcpy(skb_put(skb, nrf24->len), nrf24->buf, nrf24->len);
 			skb->pkt_type=PACKET_HOST;
-			skb->protocol = htons(ETH_P_NRF24);
+			skb->dev=nrf24->dev;
+			skb->protocol = htons(ETH_P_NONE);
 			skb_reset_mac_header(skb);
 			skb->ip_summed=CHECKSUM_UNNECESSARY;
 			netif_rx(skb);
@@ -266,8 +272,7 @@ static ssize_t receive_packet(struct nrf24_data *nrf24){
 			nrf24->dev->last_rx=jiffies;
 		}
 		CHECKOUT(read_status(nrf24),res,out)
-		pipe=(nrf24->buf[0]>>1) & 0b111;
-	}while(pipe!=0b111);
+	}while((nrf24->buf[0]&0b1110)!=0b1110);
 out:
 	return res;
 }
@@ -277,28 +282,28 @@ static irqreturn_t nrf24_handler(int irq, void *dev)
 	int res;
 	u8 status;
 	struct nrf24_data * nrf24 = (struct nrf24_data *)dev;
-	//CE_L;
+	CE_L;
 	CHECKOUT(read_status(nrf24),res,err);
 	status=nrf24->buf[0];
 	//what happened
 	if(status & TX_DS){ //tx ok, push tx payloads if available, else do nothing
 		CHECKOUT(write_payload(nrf24),res,err)
-	}else if(status & MAX_RT){ //tx fail, in prx mode this should not happen
-		flush_tx(nrf24);
-		++nrf24->dev->stats.tx_dropped;
-		--nrf24->dev->stats.tx_packets;
-		nrf24_msg("MAX_RT happened...ghost exists");
+	}else if(status & MAX_RT){ //tx fail, in prx mode this maybe means all ack are lost
+//		flush_tx(nrf24);
+//		++nrf24->dev->stats.tx_dropped;
+//		--nrf24->dev->stats.tx_packets;
+		dev_err(&nrf24->spi->dev,"MAX_RT happened...ghost exists");
 	}
 	if(status & RX_DR){ //rx ready, read out the payloads
 		receive_packet(nrf24);
 	}
 
-	CHECKOUT(set_register(nrf24,STATUS,0x70),res,err); // clear status register
+	CHECKOUT(set_register(nrf24,STATUS,0x70),res,err); // clear status register to reset irq pin
 out:
-	//CE_H;
+	CE_H;
 	return IRQ_HANDLED;
 err:
-	nrf24_msg("SPI transfer error: %d",res);
+	dev_err(&nrf24->spi->dev,"SPI transfer error: %d",res);
 	goto out;
 }
 
@@ -347,7 +352,7 @@ static int nrf24_set_mac_address(struct net_device *dev, void *addr)
 
 static int nrf24_open(struct net_device *dev)
 {
-	int			res ;
+	int			res;
 	struct nrf24_data	*nrf24=netdev_priv(dev);
 
 	if(dev->dev_addr[0]==0 || nrf24->mode == 0)return -EINVAL;
@@ -367,12 +372,43 @@ static int nrf24_open(struct net_device *dev)
 
 	CHECKOUT(power_switch(nrf24,1),res,out)
 	//enable_irq(nrf24->spi->irq);
-	CHECKOUT(request_threaded_irq(dev->irq, NULL, nrf24_handler, IRQF_TRIGGER_FALLING, "nRF24L01+", nrf24),res,out)
+	CHECKOUT(request_threaded_irq(dev->irq, NULL, nrf24_handler, IRQF_ONESHOT|IRQF_TRIGGER_FALLING, "nRF24L01+", nrf24),res,out)
 	
 	netif_start_queue(dev);
 	CE_H;
 out:
+	if(res)dev_err(&nrf24->spi->dev,"open return %d",res);
 	return res;
+}
+
+static ssize_t nrf24_reset(struct nrf24_data * nrf24)
+{
+	int retval=0;
+	
+	CE_L;
+	CHECKOUT(set_register(nrf24,CONFIG,0),retval,out)	
+	CHECKOUT(set_register(nrf24,CONFIG,0b1001),retval,out) //8bit crc, power down, prx mode
+#ifdef NRF24_DEBUG
+	CHECKOUT(read_register(nrf24,CONFIG),retval,out); 
+	if(nrf24->buf[1] != 0b1001) dev_err(&nrf24->spi->dev,"Set CONFIG failed! %#x",nrf24->buf[1]);
+#endif
+
+	CHECKOUT(flush_rx(nrf24),retval,out);
+	
+	CHECKOUT(flush_tx(nrf24),retval,out);
+	
+	CHECKOUT(set_register(nrf24,STATUS,0b1110000 ),retval,out);
+//	CHECKOUT(read_status(nrf24),retval,out);
+	CHECKOUT(read_register(nrf24,STATUS),retval,out);
+	if(nrf24->buf[0] != 0b1110 || nrf24->buf[0]!=nrf24->buf[1]) {
+		dev_err(&nrf24->spi->dev,"Error STATUS: %x %x\n",nrf24->buf[0],nrf24->buf[1]);
+		read_status(nrf24);
+		dev_err(&nrf24->spi->dev,"Error STATUS: %x\n",nrf24->buf[0]);
+		retval=-ENODEV;
+	}
+out:
+	if(retval)dev_err(&nrf24->spi->dev,"Error in reset: %d.\n",retval);
+	return retval;
 }
 
 static int nrf24_stop(struct net_device *dev)
@@ -380,11 +416,10 @@ static int nrf24_stop(struct net_device *dev)
 	struct nrf24_data	*nrf24=netdev_priv(dev);
 	struct sk_buff * skb;
 	int			res;
-	CE_L;
+	nrf24_reset(nrf24);
 	netif_stop_queue(dev);
 	//disable_irq(nrf24->spi->irq);
 	free_irq(dev->irq,nrf24);
-	CHECKOUT(power_switch(nrf24,0),res,out)
 	while ((skb = skb_dequeue(&nrf24->send_queue)))
 		dev_kfree_skb(skb);
 	
@@ -406,83 +441,60 @@ static const struct net_device_ops netdev_ops = {
 	.ndo_get_stats       = nrf24_stats,	
 };
 
-static ssize_t nrf24_reset(struct nrf24_data * nrf24)
-{
-	int retval;
-	
-	CE_L;
-		
-	CHECKOUT(set_register(nrf24,CONFIG,0b1001),retval,out) //8bit crc, power down, prx mode
-#ifdef NRF24_DEBUG
-	CHECKOUT(read_register(nrf24,CONFIG),retval,out); 
-	if(nrf24->buf[1] != 0b1001) nrf24_msg("Set CONFIG failed! %#x",nrf24->buf[1]);
-#endif
-
-	CHECKOUT(flush_rx(nrf24),retval,out);
-	
-	CHECKOUT(flush_tx(nrf24),retval,out);
-	
-	CHECKOUT(set_register(nrf24,STATUS,0b1111110 ),retval,out);
-	CHECKOUT(read_register(nrf24,STATUS),retval,out); 
-	if(nrf24->buf[1] != 0b1110) retval=-ENODEV;
-
-out:
-	return retval;
-}
 
 static ssize_t __init nrf24_initialize(struct nrf24_data * nrf24)
 {
-	ssize_t retval;
+	ssize_t retval=0;
 	
 	CHECKOUT(nrf24_reset(nrf24),retval,out); //detect presence of nrf24l01+
 	//FIXME: is it neccesary to set ard and arc for prx mode?
 	CHECKOUT(set_register(nrf24,SETUP_RETR,(1 << ARD) | (0b101 << ARC)),retval,out); //500us; retransmit 5 times
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,SETUP_RETR),retval,out);
-	if(nrf24->buf[1] != ((1 << ARD) | (0b101 << ARC)) )nrf24_msg("Set SETUP_RETR failed! %#x",nrf24->buf[1]);
+	if(nrf24->buf[1] != ((1 << ARD) | (0b101 << ARC)) )dev_err(&nrf24->spi->dev,"Set SETUP_RETR failed! %#x",nrf24->buf[1]);
 #endif	
 
 	CHECKOUT(set_register(nrf24,RF_SETUP,0b1111),retval,out); //PA max,  2Mbps
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,RF_SETUP),retval,out); 
-	if(nrf24->buf[1] != 0b1111) nrf24_msg("Set RF_SETUP failed! %#x",nrf24->buf[1]);
+	if(nrf24->buf[1] != 0b1111) dev_err(&nrf24->spi->dev,"Set RF_SETUP failed! %#x",nrf24->buf[1]);
 #endif	
-	nrf24->ch=76;
+	nrf24->ch=2;
 	CHECKOUT(set_channel(nrf24),retval,out);
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,RF_CH),retval,out); 
-	if(nrf24->buf[1] != nrf24->ch) nrf24_msg("Set RF_CH failed! %#x",nrf24->buf[1]);
+	if(nrf24->buf[1] != nrf24->ch) dev_err(&nrf24->spi->dev,"Set RF_CH failed! %#x",nrf24->buf[1]);
 #endif	
 	
 	CHECKOUT(set_register(nrf24,FEATURE,0b111 ),retval,out);
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,FEATURE),retval,out);
 	if((nrf24->buf[1]&0b111)!=0b111 )
-		nrf24_msg("Set FEATURE after toggle failed! %#x %#x",nrf24->buf[0], nrf24->buf[1]);
+		dev_err(&nrf24->spi->dev,"Set FEATURE after toggle failed! %#x %#x",nrf24->buf[0], nrf24->buf[1]);
 #endif	
 
 	CHECKOUT(set_register(nrf24,EN_AA,0b111111),retval,out); //enable auto ack on all pipes
 #ifdef NRF24_DEBUG
-	CHECKOUT(read_register(nrf24,EN_AA),retval,out); //500us; retransmit 7 times
-	if(nrf24->buf[1] != 0b111111) nrf24_msg("Set EN_AA failed! %#x",nrf24->buf[0]);
+	CHECKOUT(read_register(nrf24,EN_AA),retval,out);
+	if(nrf24->buf[1] != 0b111111) dev_err(&nrf24->spi->dev,"Set EN_AA failed! %#x",nrf24->buf[0]);
 #endif	
 	
 	CHECKOUT(set_register(nrf24,DYNPD,0b111111),retval,out); //enable dynamics payload length on all pipes
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,DYNPD),retval,out); 
-	if(nrf24->buf[1] != 0b111111) nrf24_msg("Set DYNPD failed! %#x",nrf24->buf[0]);
+	if(nrf24->buf[1] != 0b111111) dev_err(&nrf24->spi->dev,"Set DYNPD failed! %#x",nrf24->buf[0]);
 #endif	
 	nrf24->mode=0b1;//only enable pipe 0
 	CHECKOUT(set_register(nrf24,EN_RXADDR,nrf24->mode),retval,out)
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,EN_RXADDR),retval,out)
-	if(nrf24->buf[1] != 0b1) nrf24_msg("Set EN_RXADDR failed! %#x",nrf24->buf[0]);
+	if(nrf24->buf[1] != 0b1) dev_err(&nrf24->spi->dev,"Set EN_RXADDR failed! %#x",nrf24->buf[0]);
 #endif	
 	
 	CHECKOUT(set_register(nrf24,SETUP_AW,0b11),retval,out); // 5 bytes address
 #ifdef NRF24_DEBUG
 	CHECKOUT(read_register(nrf24,SETUP_AW),retval,out); 
-	if(nrf24->buf[1] != 0b11) nrf24_msg("Set SETUP_AW failed! %#x",nrf24->buf[0]);
+	if(nrf24->buf[1] != 0b11) dev_err(&nrf24->spi->dev,"Set SETUP_AW failed! %#x",nrf24->buf[0]);
 #endif
 
 	CHECKOUT(set_register(nrf24,RX_PW_P0,32),retval,out); // max rx payload length
@@ -492,8 +504,10 @@ static ssize_t __init nrf24_initialize(struct nrf24_data * nrf24)
 	CHECKOUT(set_register(nrf24,RX_PW_P4,32),retval,out); // max rx payload length
 	CHECKOUT(set_register(nrf24,RX_PW_P5,32),retval,out); // max rx payload length
 	
-	nrf24_msg("Initialized.\n");
+	CHECKOUT(activate(nrf24),retval,out);
+	
 out:
+	if(retval)dev_err(&nrf24->spi->dev,"Error in initialization: %d.\n",retval);
 	return retval;
 }
 
@@ -523,7 +537,7 @@ static int __init nrf24_probe(struct spi_device *spi)
 
 	//get params from device tree
 	if(!on){
-		dev_err(&spi->dev,"No device node found in device tree.\n");
+		dev_err(&spi->dev,"No nrf24l01+ device node found in device tree.\n");
 		return -ENODEV;
 	}
 	
@@ -604,31 +618,34 @@ gpio:
 	return status;
 }
 
-static int __exit nrf24_remove(struct spi_device *spi)
+static int __exit_call nrf24_remove(struct spi_device *spi)
 {
 	struct nrf24_data	*nrf24 = spi_get_drvdata(spi);
 	
-	nrf24_reset(nrf24); //ignore errors
+//	if(nrf24->dev->flags&IFF_UP)nrf24_stop(nrf24->dev); //it seems remove will auto call stop 
+	activate(nrf24); //deactivate
 
+
+	unregister_netdev(nrf24->dev);
+	free_netdev(nrf24->dev);
+	
 //	spin_lock_irq(&nrf24->spi_lock);
 	nrf24->spi = NULL;
 	spi_set_drvdata(spi, NULL);
 //	spin_unlock_irq(&nrf24->spi_lock);
 
-	unregister_netdev(nrf24->dev);
-	free_netdev(nrf24->dev);
-	
 	devm_gpio_free(&spi->dev, nrf24->irq_gpio);
 	devm_gpio_free(&spi->dev, nrf24->ce_gpio);
 	
-	nrf24_msg("Removed.\n");
 	return 0;
 }
 
 static int __maybe_unused nrf24_suspend(struct device *dev){
 	struct nrf24_data *nrf24=dev_get_drvdata(dev);
-	CE_L;
-	power_switch(nrf24,0);
+	if(netif_running(nrf24->dev)){
+		CE_L;
+		power_switch(nrf24,0);
+	}
 	return 0;
 }
 
@@ -666,8 +683,8 @@ static struct spi_driver nrf24_spi_driver __refdata = { //FIXME: is this the rig
 		.pm	=	&nrf24_pm,
 		.of_match_table = of_nrf24_spi_match,
 	},
-	.probe  =	nrf24_probe,
-	.remove =	__exit_p(nrf24_remove),
+	.probe =	nrf24_probe,
+	.remove =	nrf24_remove,
 	.id_table = nrf24_spi_id,
 };
 
